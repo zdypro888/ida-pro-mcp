@@ -7,6 +7,7 @@ import argparse
 import http.client
 from urllib.parse import urlparse
 from glob import glob
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,7 +18,7 @@ jsonrpc_request_id = 1
 ida_host = "127.0.0.1"
 ida_port = 13337
 
-def make_jsonrpc_request(method: str, *params):
+def make_jsonrpc_request(method: str, *params, ida_id: Optional[str] = None):
     """Make a JSON-RPC request to the IDA plugin"""
     global jsonrpc_request_id, ida_host, ida_port
     conn = http.client.HTTPConnection(ida_host, ida_port)
@@ -27,6 +28,8 @@ def make_jsonrpc_request(method: str, *params):
         "params": list(params),
         "id": jsonrpc_request_id,
     }
+    if ida_id:
+        request["target"] = ida_id
     jsonrpc_request_id += 1
 
     try:
@@ -56,10 +59,10 @@ def make_jsonrpc_request(method: str, *params):
         conn.close()
 
 @mcp.tool()
-def check_connection() -> str:
-    """Check if the IDA plugin is running"""
+def check_connection(ida_id: Optional[str] = None) -> str:
+    """Check if the IDA plugin is running. Optionally target a specific IDA instance by its short id (from list_idas)."""
     try:
-        metadata = make_jsonrpc_request("get_metadata")
+        metadata = make_jsonrpc_request("get_metadata", ida_id=ida_id)
         return f"Successfully connected to IDA Pro (open file: {metadata['module']})"
     except Exception as e:
         if sys.platform == "darwin":
@@ -122,11 +125,41 @@ class MCPVisitor(ast.NodeVisitor):
                     call_args = [ast.Constant(value=node.name)]
                     for arg in node.args.args:
                         call_args.append(ast.Name(id=arg.arg, ctx=ast.Load()))
+                    ida_id_arg = ast.arg(
+                        arg='ida_id',
+                        annotation=ast.Subscript(
+                            value=ast.Name(id='Annotated', ctx=ast.Load()),
+                            slice=ast.Tuple(
+                                elts=[
+                                    ast.Subscript(
+                                        value=ast.Name(id='Optional', ctx=ast.Load()),
+                                        slice=ast.Name(id='str', ctx=ast.Load()),
+                                        ctx=ast.Load(),
+                                    ),
+                                    ast.Call(
+                                        func=ast.Name(id='Field', ctx=ast.Load()),
+                                        args=[],
+                                        keywords=[ast.keyword(
+                                            arg='description',
+                                            value=ast.Constant(value='Target IDA instance ID (short hash) returned by list_idas. Omit to use the default (master) instance.'),
+                                        )],
+                                    ),
+                                ],
+                                ctx=ast.Load(),
+                            ),
+                            ctx=ast.Load(),
+                        ),
+                    )
+                    node.args.args.append(ida_id_arg)
+                    node.args.defaults.append(ast.Constant(value=None))
                     new_body.append(ast.Return(
                         value=ast.Call(
                             func=ast.Name(id="make_jsonrpc_request", ctx=ast.Load()),
                             args=call_args,
-                            keywords=[])))
+                            keywords=[ast.keyword(
+                                arg='ida_id',
+                                value=ast.Name(id='ida_id', ctx=ast.Load()),
+                            )])))
                     decorator_list = [
                         ast.Call(
                             func=ast.Attribute(

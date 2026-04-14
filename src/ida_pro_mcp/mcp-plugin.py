@@ -10,7 +10,16 @@ import threading
 import socket
 import time
 import uuid
+import hashlib
+import urllib.request
 from urllib.parse import urlparse, parse_qs
+
+MASTER_HOST = "127.0.0.1"
+MASTER_PORT = 13337
+WATCHDOG_PORT = 13338
+HEARTBEAT_INTERVAL = 30
+HEARTBEAT_TIMEOUT = 90
+MCP_SERVER = None  # type: ignore
 from typing import (
     Any,
     Callable,
@@ -98,6 +107,12 @@ def jsonrpc(func: Callable) -> Callable:
 def unsafe(func: Callable) -> Callable:
     """Decorator to register mark a function as unsafe"""
     return rpc_registry.mark_unsafe(func)
+
+def internal_rpc(func: Callable) -> Callable:
+    """Register a JSON-RPC method that is NOT exposed as an MCP tool."""
+    return rpc_registry.register(func)
+
+INTERNAL_METHODS = {"_register_ida", "_heartbeat_ida", "_unregister_ida"}
 
 # ============================================================================
 # MCP Streamable HTTP Implementation
@@ -214,6 +229,11 @@ class MCPProtocolHandler:
             }
             required.append(param_name)
 
+        properties["ida_id"] = {
+            "type": "string",
+            "description": "Target IDA instance ID (short hash) returned by list_idas. Omit to use the default (master) instance."
+        }
+
         # Get docstring as description
         description = func.__doc__ or f"Call {func_name}"
         if description:
@@ -233,6 +253,8 @@ class MCPProtocolHandler:
         """Generate list of all available tools"""
         tools = []
         for func_name, func in self.registry.methods.items():
+            if func_name in INTERNAL_METHODS:
+                continue
             tool_schema = self.generate_tool_schema(func_name, func)
             tools.append(tool_schema)
         return tools
@@ -254,12 +276,18 @@ class MCPProtocolHandler:
     def handle_tools_call(self, params: dict) -> dict:
         """Handle tools/call request"""
         tool_name = params.get("name")
-        arguments = params.get("arguments", {})
+        arguments = params.get("arguments", {}) or {}
 
         if not tool_name:
             raise JSONRPCError(-32602, "Missing tool name")
 
-        # Call the function via registry
+        ida_id = None
+        if isinstance(arguments, dict):
+            ida_id = arguments.pop("ida_id", None)
+
+        if ida_id and MCP_SERVER is not None and ida_id != MCP_SERVER.local_id:
+            return MCP_SERVER.forward_tools_call(ida_id, tool_name, arguments)
+
         result = self.registry.dispatch(tool_name, arguments)
 
         return {
@@ -272,55 +300,433 @@ class MCPProtocolHandler:
         }
 
 class MCPServer:
-    """MCP server using Streamable HTTP transport"""
+    """MCP server with master/slave clustering for multiple IDA instances."""
 
-    HOST = "127.0.0.1"
-    BASE_PORT = 13337
-    MAX_PORT_TRIES = 10
+    HOST = MASTER_HOST
 
     def __init__(self):
         self.server_socket = None
-        self.server_thread = None
         self.running = False
-        self.port = None  # Will be set when server starts
+        self.port = None
         self.sessions: dict[str, SessionState] = {}
         self.connections: list[SSEConnection] = []
         self.mcp_handler = MCPProtocolHandler(rpc_registry)
+        self.role = None  # "master" | "slave"
+        self.local_id = None
+        self.local_url = None
+        self.master_url = f"http://{MASTER_HOST}:{MASTER_PORT}"
+        self.slaves: dict[str, dict] = {}
+        self.slaves_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.election_lock = threading.Lock()
+        self.sweep_thread = None
+        self.heartbeat_thread = None
+        self.watchdog_listener = None
+        self.watchdog_thread = None
+        self.watchdog_conns = set()
+        self.watchdog_conns_lock = threading.Lock()
+        self.watchdog_client_sock = None
+        self.watchdog_client_thread = None
 
     def start(self):
-        """Start the MCP server"""
+        global MCP_SERVER
         if self.running:
             print("[MCP] Server is already running")
             return
-
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.running = True
-        self.server_thread.start()
+        MCP_SERVER = self
+        self.stop_event.clear()
+        self.local_id = self._compute_local_id()
+        if not self._try_become_master():
+            self._become_slave()
 
     def stop(self):
-        """Stop the MCP server"""
+        global MCP_SERVER
         if not self.running:
             return
-
         self.running = False
-
-        # Close all SSE connections
-        for conn in self.connections[:]:
-            conn.close()
-        self.connections.clear()
-
-        # Close server socket
-        if self.server_socket:
+        self.stop_event.set()
+        if self.role == "slave":
             try:
-                self.server_socket.close()
-            except:
+                self._post_master("_unregister_ida", [self.local_id])
+            except Exception:
                 pass
+        if self.watchdog_client_sock is not None:
+            try: self.watchdog_client_sock.close()
+            except Exception: pass
+            self.watchdog_client_sock = None
+        if self.watchdog_listener is not None:
+            try: self.watchdog_listener.close()
+            except Exception: pass
+            self.watchdog_listener = None
+        with self.watchdog_conns_lock:
+            for c in list(self.watchdog_conns):
+                try: c.close()
+                except Exception: pass
+            self.watchdog_conns.clear()
+        for conn in list(self.connections):
+            try: conn.close()
+            except Exception: pass
+        self.connections.clear()
+        if self.server_socket is not None:
+            try: self.server_socket.close()
+            except Exception: pass
             self.server_socket = None
-
-        if self.server_thread:
-            self.server_thread.join(timeout=2)
-
+        MCP_SERVER = None
         print("[MCP] Server stopped")
+
+    def local_metadata(self) -> dict:
+        return {
+            "module": idaapi.get_root_filename() or "",
+            "path": idaapi.get_input_file_path() or "",
+        }
+
+    def _compute_local_id(self) -> str:
+        path = idaapi.get_input_file_path() or idaapi.get_root_filename()
+        if not path:
+            return f"unnamed-{uuid.uuid4().hex[:12]}"
+        return hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
+
+    def _bind_listener(self, port: int):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        sock.bind((self.HOST, port))
+        sock.listen(16)
+        return sock
+
+    def _try_become_master(self) -> bool:
+        try:
+            sock = self._bind_listener(MASTER_PORT)
+        except OSError:
+            return False
+        try:
+            wd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            wd.bind((self.HOST, WATCHDOG_PORT))
+            wd.listen(64)
+        except OSError:
+            sock.close()
+            return False
+        self.role = "master"
+        self.server_socket = sock
+        self.port = MASTER_PORT
+        self.local_url = f"http://{self.HOST}:{MASTER_PORT}"
+        self.watchdog_listener = wd
+        threading.Thread(target=self._serve_accept_loop, args=(sock,), daemon=True).start()
+        self.watchdog_thread = threading.Thread(target=self._watchdog_serve, daemon=True)
+        self.watchdog_thread.start()
+        self.sweep_thread = threading.Thread(target=self._sweep_loop, daemon=True)
+        self.sweep_thread.start()
+        print(f"[MCP] Started as MASTER at {self.local_url} (id: {self.local_id})")
+        print(f"  Streamable HTTP: {self.local_url}/mcp")
+        print(f"  SSE: {self.local_url}/sse")
+        return True
+
+    def _become_slave(self):
+        try:
+            sock = self._bind_listener(0)
+        except OSError as e:
+            print(f"[MCP] Failed to bind slave port: {e}")
+            self.running = False
+            return
+        self.role = "slave"
+        self.server_socket = sock
+        self.port = sock.getsockname()[1]
+        self.local_url = f"http://{self.HOST}:{self.port}"
+        threading.Thread(target=self._serve_accept_loop, args=(sock,), daemon=True).start()
+        try:
+            self._register_with_master()
+        except Exception as e:
+            print(f"[MCP] Initial registration failed (will retry): {e}")
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+        self.watchdog_client_thread = threading.Thread(target=self._watchdog_client_loop, daemon=True)
+        self.watchdog_client_thread.start()
+        print(f"[MCP] Started as SLAVE at {self.local_url} (id: {self.local_id}) -> master {self.master_url}")
+
+    def _serve_accept_loop(self, sock):
+        try:
+            sock.settimeout(1.0)
+        except OSError:
+            return
+        while self.running and self.server_socket is sock:
+            try:
+                client_socket, client_address = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            t = threading.Thread(target=self._handle_client,
+                                 args=(client_socket, client_address), daemon=True)
+            t.start()
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _register_with_master(self):
+        self._post_master("_register_ida", [self.local_id, self.local_url, self.local_metadata()])
+
+    def _post_master(self, method: str, params, timeout: float = 5.0):
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            self.master_url + "/mcp",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if "error" in data:
+            raise Exception(data["error"].get("message", "rpc error"))
+        return data.get("result")
+
+    def _heartbeat_loop(self):
+        while not self.stop_event.is_set() and self.role == "slave":
+            if self.stop_event.wait(HEARTBEAT_INTERVAL):
+                break
+            ok = False
+            need_reregister = False
+            try:
+                self._post_master("_heartbeat_ida", [self.local_id])
+                ok = True
+            except Exception as e:
+                if "Unknown slave" in str(e):
+                    need_reregister = True
+            if need_reregister:
+                try:
+                    self._register_with_master()
+                    ok = True
+                except Exception:
+                    pass
+            if not ok:
+                self._handle_master_dead()
+
+    def _handle_master_dead(self):
+        if not self.election_lock.acquire(blocking=False):
+            return
+        try:
+            if self.role != "slave" or self.stop_event.is_set():
+                return
+            print("[MCP] Master appears dead, attempting election")
+            try:
+                with socket.create_connection((MASTER_HOST, MASTER_PORT), timeout=2):
+                    pass
+                try: self._register_with_master()
+                except Exception: pass
+                return
+            except OSError:
+                pass
+            if self._try_promote_to_master():
+                return
+            time.sleep(0.5)
+            try: self._register_with_master()
+            except Exception: pass
+        finally:
+            self.election_lock.release()
+
+    def _try_promote_to_master(self) -> bool:
+        try:
+            new_sock = self._bind_listener(MASTER_PORT)
+        except OSError:
+            return False
+        try:
+            wd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            wd.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            wd.bind((self.HOST, WATCHDOG_PORT))
+            wd.listen(64)
+        except OSError:
+            new_sock.close()
+            return False
+        old_sock = self.server_socket
+        old_wd_client = self.watchdog_client_sock
+        self.watchdog_client_sock = None
+        self.server_socket = new_sock
+        self.port = MASTER_PORT
+        self.local_url = f"http://{self.HOST}:{MASTER_PORT}"
+        self.watchdog_listener = wd
+        self.role = "master"
+        with self.slaves_lock:
+            self.slaves.clear()
+        if old_sock is not None:
+            try: old_sock.close()
+            except Exception: pass
+        if old_wd_client is not None:
+            try: old_wd_client.close()
+            except Exception: pass
+        threading.Thread(target=self._serve_accept_loop, args=(new_sock,), daemon=True).start()
+        self.watchdog_thread = threading.Thread(target=self._watchdog_serve, daemon=True)
+        self.watchdog_thread.start()
+        if self.sweep_thread is None or not self.sweep_thread.is_alive():
+            self.sweep_thread = threading.Thread(target=self._sweep_loop, daemon=True)
+            self.sweep_thread.start()
+        print(f"[MCP] Promoted to MASTER at {self.local_url}")
+        return True
+
+    def _sweep_loop(self):
+        while not self.stop_event.is_set() and self.role == "master":
+            if self.stop_event.wait(HEARTBEAT_INTERVAL):
+                break
+            now = time.time()
+            with self.slaves_lock:
+                stale = [k for k, v in self.slaves.items() if now - v["last_heartbeat"] > HEARTBEAT_TIMEOUT]
+                for k in stale:
+                    print(f"[MCP] Removing stale slave (sweep): {k}")
+                    del self.slaves[k]
+
+    def _watchdog_serve(self):
+        listener = self.watchdog_listener
+        if listener is None:
+            return
+        try:
+            listener.settimeout(1.0)
+        except OSError:
+            return
+        while not self.stop_event.is_set() and self.role == "master" and self.watchdog_listener is listener:
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            t = threading.Thread(target=self._watchdog_handle, args=(conn,), daemon=True)
+            t.start()
+        try: listener.close()
+        except Exception: pass
+
+    def _watchdog_handle(self, conn):
+        slave_id = None
+        try:
+            conn.settimeout(5.0)
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = conn.recv(64)
+                if not chunk:
+                    return
+                buf += chunk
+                if len(buf) > 256:
+                    return
+            slave_id = buf.strip().decode("utf-8", errors="replace")
+            conn.settimeout(None)
+        except Exception:
+            try: conn.close()
+            except Exception: pass
+            return
+        with self.watchdog_conns_lock:
+            self.watchdog_conns.add(conn)
+        attached = False
+        deadline = time.time() + 5
+        while time.time() < deadline and not self.stop_event.is_set():
+            with self.slaves_lock:
+                if slave_id in self.slaves:
+                    self.slaves[slave_id]["watchdog_conn"] = conn
+                    attached = True
+                    break
+            time.sleep(0.05)
+        if not attached:
+            with self.watchdog_conns_lock:
+                self.watchdog_conns.discard(conn)
+            try: conn.close()
+            except Exception: pass
+            return
+        try:
+            while True:
+                data = conn.recv(64)
+                if not data:
+                    break
+        except Exception:
+            pass
+        with self.watchdog_conns_lock:
+            self.watchdog_conns.discard(conn)
+        with self.slaves_lock:
+            info = self.slaves.get(slave_id) if slave_id else None
+            if info is not None and info.get("watchdog_conn") is conn:
+                print(f"[MCP] Slave disconnected (watchdog): {slave_id}")
+                del self.slaves[slave_id]
+        try: conn.close()
+        except Exception: pass
+
+    def _watchdog_client_loop(self):
+        while not self.stop_event.is_set() and self.role == "slave":
+            try:
+                sock = socket.create_connection((MASTER_HOST, WATCHDOG_PORT), timeout=5)
+                sock.sendall((self.local_id + "\n").encode("utf-8"))
+            except Exception:
+                if self.stop_event.wait(1):
+                    return
+                continue
+            self.watchdog_client_sock = sock
+            try:
+                while not self.stop_event.is_set():
+                    data = sock.recv(64)
+                    if not data:
+                        break
+            except Exception:
+                pass
+            try: sock.close()
+            except Exception: pass
+            self.watchdog_client_sock = None
+            if self.stop_event.is_set() or self.role != "slave":
+                return
+            self._handle_master_dead()
+
+    def forward_tools_call(self, ida_id: str, tool_name: str, arguments: dict) -> dict:
+        slave = None
+        with self.slaves_lock:
+            slave = self.slaves.get(ida_id)
+        if slave is None:
+            raise JSONRPCError(-32004, f"Unknown IDA instance: {ida_id}")
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+            "id": 1,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            slave["url"] + "/mcp",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            raise JSONRPCError(-32005, f"Forward to slave failed: {e}")
+        if "error" in data:
+            err = data["error"]
+            raise JSONRPCError(err.get("code", -32603), err.get("message", "forward error"), err.get("data"))
+        return data.get("result", {})
+
+    def forward_raw_rpc(self, ida_id: str, request: dict):
+        slave = None
+        with self.slaves_lock:
+            slave = self.slaves.get(ida_id)
+        if slave is None:
+            raise JSONRPCError(-32004, f"Unknown IDA instance: {ida_id}")
+        forward_req = {k: v for k, v in request.items() if k != "target"}
+        forward_req.setdefault("id", 1)
+        body = json.dumps(forward_req).encode("utf-8")
+        req = urllib.request.Request(
+            slave["url"] + "/mcp",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            raise JSONRPCError(-32005, f"Forward to slave failed: {e}")
+        if "error" in data:
+            err = data["error"]
+            raise JSONRPCError(err.get("code", -32603), err.get("message", "forward error"), err.get("data"))
+        return data.get("result")
 
     def _parse_http_request(self, data: bytes) -> tuple[str, str, dict, bytes]:
         """Parse raw HTTP request. Returns (method, path, headers, body)"""
@@ -413,6 +819,12 @@ class MCPServer:
                     result = self.mcp_handler.handle_tools_list(params)
                 elif method == "tools/call":
                     result = self.mcp_handler.handle_tools_call(params)
+                elif method in self.mcp_handler.registry.methods:
+                    target = request.get("target")
+                    if target and MCP_SERVER is not None and target != MCP_SERVER.local_id:
+                        result = MCP_SERVER.forward_raw_rpc(target, request)
+                    else:
+                        result = self.mcp_handler.registry.dispatch(method, request.get("params", []))
                 else:
                     raise JSONRPCError(-32601, f"Method not found: {method}")
 
@@ -533,6 +945,12 @@ class MCPServer:
                     result = self.mcp_handler.handle_tools_list(params)
                 elif method == "tools/call":
                     result = self.mcp_handler.handle_tools_call(params)
+                elif method in self.mcp_handler.registry.methods:
+                    target = request.get("target")
+                    if target and MCP_SERVER is not None and target != MCP_SERVER.local_id:
+                        result = MCP_SERVER.forward_raw_rpc(target, request)
+                    else:
+                        result = self.mcp_handler.registry.dispatch(method, request.get("params", []))
                 else:
                     raise JSONRPCError(-32601, f"Method not found: {method}")
 
@@ -770,66 +1188,6 @@ class MCPServer:
             except:
                 pass
 
-    def _run_server(self):
-        """Run the SSE server main loop"""
-        try:
-            # Try to bind to a port starting from BASE_PORT
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            for i in range(self.MAX_PORT_TRIES):
-                port = self.BASE_PORT + i
-                try:
-                    self.server_socket.bind((self.HOST, port))
-                    self.port = port
-                    break
-                except OSError as e:
-                    if e.errno in (98, 10048):  # Address already in use
-                        if i == self.MAX_PORT_TRIES - 1:
-                            raise OSError(f"Could not find available port in range {self.BASE_PORT}-{self.BASE_PORT + self.MAX_PORT_TRIES - 1}")
-                        continue
-                    raise
-
-            self.server_socket.listen(5)
-            self.server_socket.settimeout(1.0)  # Timeout for accept
-
-            print(f"[MCP] Server started:")
-            print(f"  Streamable HTTP: http://{self.HOST}:{self.port}/mcp")
-            print(f"  SSE: http://{self.HOST}:{self.port}/sse")
-
-            while self.running:
-                try:
-                    client_socket, client_address = self.server_socket.accept()
-                    # Handle each client in a separate thread
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client_socket, client_address),
-                        daemon=True
-                    )
-                    client_thread.start()
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    if self.running:
-                        print(f"[MCP] Error accepting connection: {e}")
-
-        except OSError as e:
-            if e.errno == 98 or e.errno == 10048:  # Port already in use
-                print(f"[MCP] Error: Port {self.port} is already in use")
-            else:
-                print(f"[MCP] Server error: {e}")
-            self.running = False
-        except Exception as e:
-            print(f"[MCP] Server error: {e}")
-            traceback.print_exc()
-        finally:
-            self.running = False
-            if self.server_socket:
-                try:
-                    self.server_socket.close()
-                except:
-                    pass
-
 # A module that helps with writing thread safe ida code.
 # Based on:
 # https://web.archive.org/web/20160305190440/http://www.williballenthin.com/blog/2015/09/04/idapython-synchronization-decorator/
@@ -983,6 +1341,71 @@ def is_window_active():
         if widget.isActiveWindow():
             return True
     return False
+
+@internal_rpc
+def _register_ida(idb_path: str, url: str, metadata: dict) -> str:
+    if MCP_SERVER is None or MCP_SERVER.role != "master":
+        raise JSONRPCError(-32010, "Not a master instance")
+    with MCP_SERVER.slaves_lock:
+        MCP_SERVER.slaves[idb_path] = {
+            "url": url,
+            "metadata": metadata,
+            "last_heartbeat": time.time(),
+        }
+    print(f"[MCP] Registered slave: {idb_path} @ {url}")
+    return "ok"
+
+@internal_rpc
+def _heartbeat_ida(idb_path: str) -> str:
+    if MCP_SERVER is None or MCP_SERVER.role != "master":
+        raise JSONRPCError(-32010, "Not a master instance")
+    with MCP_SERVER.slaves_lock:
+        if idb_path in MCP_SERVER.slaves:
+            MCP_SERVER.slaves[idb_path]["last_heartbeat"] = time.time()
+            return "ok"
+    raise JSONRPCError(-32011, "Unknown slave; please re-register")
+
+@internal_rpc
+def _unregister_ida(idb_path: str) -> str:
+    if MCP_SERVER is None or MCP_SERVER.role != "master":
+        raise JSONRPCError(-32010, "Not a master instance")
+    with MCP_SERVER.slaves_lock:
+        MCP_SERVER.slaves.pop(idb_path, None)
+    return "ok"
+
+class IdaInstance(TypedDict):
+    id: str
+    role: str
+    url: str
+    module: str
+    path: str
+
+@jsonrpc
+def list_idas() -> list[IdaInstance]:
+    """List all IDA Pro instances connected through the master."""
+    if MCP_SERVER is None:
+        return []
+    result: list[IdaInstance] = []
+    meta = MCP_SERVER.local_metadata()
+    result.append(IdaInstance(
+        id=MCP_SERVER.local_id,
+        role=MCP_SERVER.role or "unknown",
+        url=MCP_SERVER.local_url or "",
+        module=meta.get("module", ""),
+        path=meta.get("path", ""),
+    ))
+    if MCP_SERVER.role == "master":
+        with MCP_SERVER.slaves_lock:
+            for k, v in MCP_SERVER.slaves.items():
+                m = v.get("metadata") or {}
+                result.append(IdaInstance(
+                    id=k,
+                    role="slave",
+                    url=v.get("url", ""),
+                    module=m.get("module", ""),
+                    path=m.get("path", ""),
+                ))
+    return result
 
 class Metadata(TypedDict):
     path: str
