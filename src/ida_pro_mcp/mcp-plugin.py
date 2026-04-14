@@ -656,6 +656,7 @@ class MCPServer:
             try:
                 sock = socket.create_connection((MASTER_HOST, WATCHDOG_PORT), timeout=5)
                 sock.sendall((self.local_id + "\n").encode("utf-8"))
+                sock.settimeout(None)
             except Exception:
                 if self.stop_event.wait(1):
                     return
