@@ -337,6 +337,10 @@ class MCPServer:
         MCP_SERVER = self
         self.stop_event.clear()
         self.local_id = self._compute_local_id()
+        self._cached_metadata = {
+            "module": idaapi.get_root_filename() or "",
+            "path": idaapi.get_input_file_path() or "",
+        }
         if not self._try_become_master():
             self._become_slave()
 
@@ -376,10 +380,7 @@ class MCPServer:
         print("[MCP] Server stopped")
 
     def local_metadata(self) -> dict:
-        return {
-            "module": idaapi.get_root_filename() or "",
-            "path": idaapi.get_input_file_path() or "",
-        }
+        return dict(getattr(self, "_cached_metadata", {}) or {})
 
     def _compute_local_id(self) -> str:
         path = idaapi.get_input_file_path() or idaapi.get_root_filename()
