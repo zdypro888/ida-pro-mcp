@@ -339,7 +339,7 @@ class MCPServer:
         self.local_id = self._compute_local_id()
         self._cached_metadata = {
             "module": idaapi.get_root_filename() or "",
-            "path": idaapi.get_input_file_path() or "",
+            "path": _get_idb_path() or idaapi.get_input_file_path() or "",
         }
         if not self._try_become_master():
             self._become_slave()
@@ -383,7 +383,7 @@ class MCPServer:
         return dict(getattr(self, "_cached_metadata", {}) or {})
 
     def _compute_local_id(self) -> str:
-        path = idaapi.get_input_file_path() or idaapi.get_root_filename()
+        path = _get_idb_path() or idaapi.get_input_file_path() or idaapi.get_root_filename()
         if not path:
             return f"unnamed-{uuid.uuid4().hex[:12]}"
         return hashlib.sha1(path.encode("utf-8")).hexdigest()[:12]
@@ -518,16 +518,20 @@ class MCPServer:
             try:
                 with socket.create_connection((MASTER_HOST, MASTER_PORT), timeout=2):
                     pass
-                try: self._register_with_master()
-                except Exception: pass
+                try:
+                    self._register_with_master()
+                except Exception as e:
+                    print(f"[MCP] Re-register to existing master failed: {e}")
                 return
             except OSError:
                 pass
             if self._try_promote_to_master():
                 return
             time.sleep(0.5)
-            try: self._register_with_master()
-            except Exception: pass
+            try:
+                self._register_with_master()
+            except Exception as e:
+                print(f"[MCP] Re-register after failed election: {e}")
         finally:
             self.election_lock.release()
 
@@ -621,15 +625,16 @@ class MCPServer:
         with self.watchdog_conns_lock:
             self.watchdog_conns.add(conn)
         attached = False
-        deadline = time.time() + 5
+        deadline = time.time() + 15
         while time.time() < deadline and not self.stop_event.is_set():
             with self.slaves_lock:
                 if slave_id in self.slaves:
                     self.slaves[slave_id]["watchdog_conn"] = conn
                     attached = True
                     break
-            time.sleep(0.05)
+            time.sleep(0.1)
         if not attached:
+            print(f"[MCP] Watchdog rejected (slave {slave_id} not registered after 15s)")
             with self.watchdog_conns_lock:
                 self.watchdog_conns.discard(conn)
             try: conn.close()
@@ -1220,6 +1225,17 @@ import ida_frame
 import ida_segment
 
 ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
+
+def _get_idb_path() -> str:
+    try:
+        if hasattr(idaapi, "PATH_TYPE_IDB") and hasattr(idaapi, "get_path"):
+            return idaapi.get_path(idaapi.PATH_TYPE_IDB) or ""
+    except Exception:
+        pass
+    try:
+        return idc.get_idb_path() or ""
+    except Exception:
+        return ""
 
 class IDAError(Exception):
     def __init__(self, message: str):
